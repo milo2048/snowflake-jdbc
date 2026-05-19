@@ -7,6 +7,7 @@ import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.databind.MappingJsonFactory;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.ByteArrayOutputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
@@ -953,18 +954,21 @@ public class SnowflakeChunkDownloader implements ChunkDownloader {
        * @throws SnowflakeSQLException
        */
       private void downloadAndParseChunk(InputStream inputStream) throws SnowflakeSQLException {
-        // remember the download time
-        resultChunk.setDownloadTime(System.currentTimeMillis() - startTime);
-        downloader.addDownloadTime(resultChunk.getDownloadTime());
+        // Time spent before any body bytes were read (HTTP connect + TLS + response headers).
+        long connectionSetupMs = System.currentTimeMillis() - startTime;
 
-        startTime = System.currentTimeMillis();
+        // Wrap the stream so we can measure how long the parser is blocked waiting on the
+        // network. getResultStreamProvider().getInputStream() returns once headers come back,
+        // but the response body is streamed lazily during the read*() calls below — so the
+        // bulk of true download time is spent inside read(), not before it.
+        TimingInputStream timedStream = new TimingInputStream(inputStream);
 
-        // parse the result json
+        long parseStart = System.currentTimeMillis();
         try {
           if (downloader.queryResultFormat == QueryResultFormat.ARROW) {
-            ((ArrowResultChunk) resultChunk).readArrowStream(inputStream);
+            ((ArrowResultChunk) resultChunk).readArrowStream(timedStream);
           } else {
-            parseJsonToChunkV2(inputStream, resultChunk);
+            parseJsonToChunkV2(timedStream, resultChunk);
           }
         } catch (Exception ex) {
           logger.debug(
@@ -997,9 +1001,15 @@ public class SnowflakeChunkDownloader implements ChunkDownloader {
           }
         }
 
-        // add parsing time
-        resultChunk.setParseTime(System.currentTimeMillis() - startTime);
-        downloader.addParsingTime(resultChunk.getParseTime());
+        long readPlusParseMs = System.currentTimeMillis() - parseStart;
+        long networkReadMs = TimeUnit.NANOSECONDS.toMillis(timedStream.getNanosBlocked());
+        long actualParseMs = Math.max(0L, readPlusParseMs - networkReadMs);
+        long totalDownloadMs = connectionSetupMs + networkReadMs;
+
+        resultChunk.setDownloadTime(totalDownloadMs);
+        downloader.addDownloadTime(totalDownloadMs);
+        resultChunk.setParseTime(actualParseMs);
+        downloader.addParsingTime(actualParseMs);
       }
 
       private long startTime;
@@ -1187,6 +1197,38 @@ public class SnowflakeChunkDownloader implements ChunkDownloader {
     @Override
     public DownloaderMetrics terminate() {
       return null;
+    }
+  }
+
+  /**
+   * InputStream wrapper that accumulates the time spent blocked inside read() calls. Used to
+   * separate true network read time from CPU-bound parsing time when reading a chunk.
+   */
+  private static final class TimingInputStream extends FilterInputStream {
+    private long nanosBlocked = 0L;
+
+    TimingInputStream(InputStream in) {
+      super(in);
+    }
+
+    long getNanosBlocked() {
+      return nanosBlocked;
+    }
+
+    @Override
+    public int read() throws IOException {
+      long t0 = System.nanoTime();
+      int b = in.read();
+      nanosBlocked += System.nanoTime() - t0;
+      return b;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+      long t0 = System.nanoTime();
+      int n = in.read(b, off, len);
+      nanosBlocked += System.nanoTime() - t0;
+      return n;
     }
   }
 }
