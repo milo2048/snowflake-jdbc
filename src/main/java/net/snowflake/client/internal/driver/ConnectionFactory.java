@@ -67,6 +67,18 @@ public final class ConnectionFactory {
       params.getParams().put(AutoConfigurationHelper.DEFERRED_LOG_MESSAGES_KEY, deferred);
     }
 
+    // TODO(SNOW-3548350): Transfer the captured ConnectionIdentifierShape from ConnectionParameters
+    // onto Properties so it threads through to DefaultSFConnectionHandler.initialize() and is set
+    // on the SFSession before open() emits the client_connection_identifier_shape telemetry.
+    // Remove together with the rest of the connection-identifier-shape plumbing.
+    if (params.getConnectionIdentifierShape() != null) {
+      params
+          .getParams()
+          .put(
+              AutoConfigurationHelper.CONNECTION_IDENTIFIER_SHAPE_KEY,
+              params.getConnectionIdentifierShape());
+    }
+
     // Create and return the connection implementation
     return new SnowflakeConnectionImpl(params.getUrl(), params.getParams());
   }
